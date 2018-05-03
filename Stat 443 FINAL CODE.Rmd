@@ -1,0 +1,1356 @@
+---
+title: "Stat 443 Final Code"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading packages
+```{r}
+install.packages(c("lubridate", "fitdistrplus", "ChainLadder", "dplyr", "tibble", "reshape2", "statmod", "glm2", "MASS", "cplm", "stringr", "ggplot2"))
+
+library(lubridate)
+library(fitdistrplus)
+library(ChainLadder)
+library(dplyr)
+library(tibble)
+library(reshape2)
+library(statmod)
+library(glm2)
+library(MASS)
+library(cplm)
+library(stringr)
+library(ggplot2)
+
+```
+
+
+Reading in and viewing Property Data
+```{r}
+property_dataset <- read.csv("Property Data Set.csv")
+
+attach(property_dataset)
+
+View(property_dataset)
+
+nrow(property_dataset) #166064 rows
+```
+
+Original data cleaning on original data set provided
+Data cleaning 1
+```{r}
+# drop rows whose Loss_Incurred is 'NA' value (28 rows)
+property_dataset = property_dataset[!is.na(property_dataset$Loss_Incurred),]
+nrow(property_dataset) #166036 rows
+```
+
+Data Cleaning 2
+```{r}
+# drop rows where a single claim is evaluated for more than one time in the same month within the same year
+names(property_dataset)
+#(use "dplyr" package)
+#names(property_dataset)
+ungrouped1=property_dataset %>% mutate(claimdate_combine1=paste(Claim_No, Evaluation_Date)) %>% arrange(Claim_No, Evaluation_Date) 
+
+property1= group_by(ungrouped1, claimdate_combine1) %>% summarise(Loss_Incurred1=max(Loss_Incurred), Claim_No1= first(Claim_No), Evaluation_Date1=first(Evaluation_Date),Accident_Date1=first(Accident_Date), Loss_Paid1=max(Loss_Paid))
+
+### Extract accident year and month ###
+Accident_Year = year(as.Date(property1$Accident_Date1))
+Accident_Month = month(as.Date(property1$Accident_Date1))
+
+
+### Extract evaluation year and month ###
+Evaluation_yearmonth = property1$Evaluation_Date1
+
+# Extract evaluation year
+sub_year = function(Evaluation_yearmonth) {
+  as.numeric(substr(Evaluation_yearmonth, 1, 4))}
+Evaluation_Year = sapply(Evaluation_yearmonth, sub_year)
+
+# Extract evaluation month
+sub_month = function(Evaluation_yearmonth) {
+  as.numeric(substr(Evaluation_yearmonth, 5, 6))}
+Evaluation_Month = sapply(Evaluation_yearmonth, sub_month)
+
+
+property1$Accident_Year = Accident_Year
+property1$Accident_Month = Accident_Month
+property1$Evaluation_Year = Evaluation_Year
+property1$Evaluation_Month = Evaluation_Month
+```
+
+Data Cleaning 3
+```{r}
+# drop rows where a single claim is evaluated for more than one time in the same year 
+ungrouped2=property1 %>% mutate(claimdate_combine2=paste(Claim_No1, Evaluation_Year)) %>% arrange(Claim_No1, Evaluation_Year) 
+property_data= group_by(ungrouped2, claimdate_combine2) %>% summarise(LossIncurred=max(Loss_Incurred1), ClaimNo= first(Claim_No1), EvaluationDate=first(Evaluation_Date1),AccidentDate=first(Accident_Date1), LossPaid=max(Loss_Paid1), AccidentYear = first(Accident_Year), AccidentMonth = first(Accident_Month), EvaluationYear = first(Evaluation_Year), EvaluationMonth = first(Evaluation_Month))
+
+#nrow(ungrouped2) #154929 rows== nrow(property1)
+#nrow(property_data) # 86102 rows 
+
+#names(property_data)
+#View(property_data)
+
+### Build triangle ###
+# Create development column
+property_data$devcol<-property_data$EvaluationYear- property_data$AccidentYear
+
+
+# Drop observations that have a negative development period
+property_data <-property_data[property_data$devcol>0,] 
+```
+
+
+
+Original Triangle development
+```{r}
+property_tri<-as.triangle(property_data,origin="AccidentYear",dev="devcol",value="LossIncurred")
+property_tri
+nrow(property_tri)
+ncol(property_tri)
+
+#property_tri[,1]
+#sum(property_tri[,1])
+
+### Plotting triangles 
+plot(property_tri)
+#plot the individual plots for each origin period
+plot(property_tri, lattice=TRUE)
+
+```
+
+
+Calculate the Year to Year Ratio
+```{r}
+n <- ncol(property_tri)
+yeartoyearRatio <- sapply(1:(n-1),
+               function(i){
+                 sum(property_tri[c(1:(n-i)),i+1])/sum(property_tri[c(1:(n-i)),i])
+               } )
+yeartoyearRatio
+```
+
+Calculate the Year to Year Ratio Matrix
+```{r}
+
+individualRatio=matrix(nrow=nrow(property_tri)-1,ncol=ncol(property_tri)-1)
+
+for(i in 1:nrow(individualRatio)){
+  
+  for(j in 1:ncol(individualRatio)){
+      inRatio = property_tri[i, j+1]/property_tri[i, j]
+      #print(j)
+      individualRatio[i,j]= inRatio
+  }
+}
+
+yearRatioTri<-as.triangle(individualRatio,origin="property_data$AccidentYear",dev="property_data$devcol",value="YeartoYearRatio")
+
+yearRatioTri
+```
+
+
+Create the Upper left triangle using chainladder model
+```{r}
+# first, Create a matrix to input the values obtained from chainladder: 
+property_ChainLadder=matrix(nrow=nrow(property_tri),ncol=nrow(property_tri))
+# Second, Copy the first column from the prigin triangle to the new created triangle:
+property_ChainLadder[,1] = property_tri[,1]
+property_ChainLadder
+
+# Third, use loop to calculate the new values in each development period;
+chainladder_row = nrow(property_ChainLadder)-1
+
+for(i in 1: chainladder_row) {
+  k=ncol(property_ChainLadder)+1-i
+  for(j in 2:k){
+    chainladder_loss = property_tri[i,j-1]*yeartoyearRatio[j-1]
+    #print(j)
+    property_ChainLadder[i,j]=chainladder_loss
+  }
+}
+
+# Lastly, transform the matrix into a triangle; 
+ChainLadder_Tri<-as.triangle(property_ChainLadder,origin="AccidentYear",dev="devcol",value="Chain Ladder Value")
+
+ChainLadder_Tri
+
+plot(ChainLadder_Tri)
+```
+
+Reshaping Data for different models
+```{r}
+attach(property_data)
+nrow(property_data) # 76297 rows
+
+reshape_data = property_data
+attach(reshape_data)
+nrow(reshape_data) #76297
+#View(reshape_data)
+#names(reshape_data)
+
+
+startyear = reshape_data$AccidentYear
+evalyear = reshape_data$EvaluationYear
+reshape_devcol = evalyear - startyear
+acci_year= reshape_data$AccidentYear 
+acciyear= reshape_data$AccidentYear 
+subData  <- data.frame(ClaimNo,LossIncurred, startyear, evalyear, reshape_devcol, acci_year)
+attach(subData)
+
+
+melt_subData = melt(subData, id.vars=c("ClaimNo", "reshape_devcol", "acci_year"), measure.vars = "LossIncurred", na.rm = FALSE)
+dcast_subData=dcast(melt_subData, ClaimNo + reshape_devcol + acciyear~ variable, value.var = "value")
+
+property_reshape = dcast(melt_subData, ClaimNo + acciyear~ reshape_devcol,  value.var = "value")
+
+nrow(property_reshape) #11085
+property_reshape
+```
+
+
+Using the Tweedie Model 
+```{r}
+tweedie_reshape = property_reshape
+nrow(tweedie_reshape) #11085
+library(tweedie)
+library(statmod)
+attach(tweedie_reshape)
+
+### fit tweedie model for thirteen times to predict fourteen years' losses ###
+#Part 1:
+  #Subset(previous yr and dev yr) >> Data Cleaning (0, NA) >> Find parameter p (tweedie.profile)
+#Part 2:
+  #fit tweedie model within each subset
+#Part 3:
+  # create each columns for property_tweedie(the tweedie triangle, using for loop)
+#Part 4:
+# combine the columns together into a 14*14 matrix; change all the zero values into NA values;
+# use as.triangle transform the matrix into a triangle (tweedie_Tri)
+#Part 5:
+# calculate the ratio of the tweedie triangle >> calculate the ultimate loss for tweedie triangle;
+
+
+
+### 1. create a subset for predicting loss in dev 2 using loss in dev 1 ### [sub_1to2]
+
+# drop rows whose first year and second year losses are NAs (1) #
+sub_1to2 = tweedie_reshape[(!is.na(tweedie_reshape[,3])) & (!is.na(tweedie_reshape[,4])),]
+attach(sub_1to2)
+
+
+# drop rows whose first and second year losses are negative (2) #
+sub_1to2 = sub_1to2[!sub_1to2[,3] < 0,]
+sub_1to2 = sub_1to2[!sub_1to2[,4] < 0,]
+
+
+
+# drop rows whose first year losses are zeros (3) #
+sub_1to2 = sub_1to2[!round(sub_1to2[,3], 0) == 0,]
+
+
+indiClaimNo_1to2 = sub_1to2[,1]
+acci_year_1to2 = sub_1to2[,2]
+previousloss_1to2 = round(sub_1to2[,3], 0)
+devloss_1to2= round(sub_1to2[,4], 0)
+
+#check row numbers
+#sum(devloss_1to2 == 0) #0
+#sum(devloss_1to2 > 0) #6336
+#sum(devloss_1to2 < 0) #0
+
+#summary(previousloss_1to2)
+#summary(devloss_1to2)
+
+#out_1to2= tweedie.profile(devloss_1to2 ~ previousloss_1to2, p.vec=seq(1, 2, by=0.1), data= sub_1to2)
+
+#names(out_1to2)
+#out_1to2$p.max
+
+fit_1to2= glm(devloss_1to2 ~ previousloss_1to2,family= tweedie(var.power=1.6, link.power= -0.6), data= sub_1to2, model = TRUE)
+
+#******************** Fit time directly use the p_max from tweedie_profile
+
+#summary(fit_1to2)
+#help(tweedie)
+#residual=2952600467
+
+ 
+  
+
+### 2. create a subset for predicting loss in dev 3 using loss in dev 2 ### [sub_2to3]
+
+# drop rows whose second year and third year losses are NAs (1) #
+sub_2to3 = tweedie_reshape[(!is.na(tweedie_reshape[,4])) & (!is.na(tweedie_reshape[,5])),]
+attach(sub_2to3)
+
+# drop rows whose second and third year losses are negative (2) #
+sub_2to3 = sub_2to3[!sub_2to3[,4] < 0,]
+sub_2to3 = sub_2to3[!sub_2to3[,5] < 0,]
+#names(sub_2to3)
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_2to3 = sub_2to3[!round(sub_2to3[,4], 0) == 0,]
+
+
+indiClaimNo_2to3 = sub_2to3[,1]
+acci_year_2to3 = sub_2to3[,2]
+previousloss_2to3 = round(sub_2to3[,4], 0)
+devloss_2to3= round(sub_2to3[,5], 0)
+
+#check row numbers
+#sum(previousloss_2to3 == 0) #0
+#sum(previousloss_2to3 > 0) #5922
+#sum(previousloss_2to3 < 0) #0
+
+#summary(previousloss_2to3)
+#summary(devloss_2to3)
+
+#out_2to3= tweedie.profile(devloss_2to3 ~ previousloss_2to3, p.vec=seq(1, 2, by=0.1), data= sub_2to3 )
+# tweedie.profile is calculating the maxiized likelihood estimator thus takes a while to run;
+
+# names(out_2to3)
+# out_2to3$p
+# out_2to3$p.max
+# out_2to3$L
+
+fit_2to3= glm(devloss_2to3 ~ previousloss_2to3,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_2to3, model = TRUE)
+
+
+#******************** cannot Fit time directly use the p_max from tweedie_profile (1.8); thus, according to loglikehood, 
+#find the cloest estimator with the second largest L (1.7)
+
+
+  
+  
+  
+### 3. create a subset for predicting loss in dev 4 using loss in dev 3 ### [sub_3to4]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_3to4 = tweedie_reshape[(!is.na(tweedie_reshape[,5])) & (!is.na(tweedie_reshape[,6])),]
+attach(sub_3to4)
+
+
+# drop rows whose second and third year losses are negative (2) #
+sub_3to4 = sub_3to4[!sub_3to4[,5] < 0,]
+sub_3to4 = sub_3to4[!sub_3to4[,6] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_3to4 = sub_3to4[!round(sub_3to4[,5], 0) == 0,]
+
+
+indiClaimNo_3to4 = sub_3to4[,1]
+acci_year_3to4 = sub_3to4[,2]
+previousloss_3to4 = round(sub_3to4[,5], 0)
+devloss_3to4= round(sub_3to4[,6], 0)
+
+#check row numbers
+#sum(previousloss_3to4 == 0) #0
+#sum(previousloss_3to4 > 0) #5659
+#sum(previousloss_3to4 < 0) #0
+
+#summary(previousloss_3to4)
+#summary(devloss_3to4)
+
+# out_3to4= tweedie.profile(devloss_3to4 ~ previousloss_3to4, p.vec=seq(1, 2, by=0.1), data= sub_3to4)
+# 
+# names(out_3to4)
+# out_3to4$p.max
+# out_3to4$p
+# out_3to4$L
+
+fit_3to4= glm(devloss_3to4 ~ previousloss_3to4,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_3to4, model = TRUE)
+
+
+#******************** ??cannot Fit time directly use the p_max from tweedie_profile (1.8); thus, according to loglikehood, 
+#find the cloest estimator with the second largest L (1.7)
+
+  
+  
+  
+  
+### 4. create a subset for predicting loss in dev 5 using loss in dev 4 ### [sub_4to5]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_4to5 = tweedie_reshape[(!is.na(tweedie_reshape[,6])) & (!is.na(tweedie_reshape[,7])),]
+attach(sub_4to5)
+
+# drop rows whose second and third year losses are negative (2) #
+sub_4to5 = sub_4to5[!sub_4to5[,6] < 0,]
+sub_4to5 = sub_4to5[!sub_4to5[,7] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_4to5 = sub_4to5[!round(sub_4to5[,6], 0) == 0,]
+
+
+indiClaimNo_4to5 = sub_4to5[,1]
+acci_year_4to5 = sub_4to5[,2]
+previousloss_4to5 = round(sub_4to5[,6], 0)
+devloss_4to5= round(sub_4to5[,7], 0)
+
+#check row numbers
+#sum(previousloss_3to4 == 0) #0
+#sum(previousloss_3to4 > 0) #5659
+#sum(previousloss_3to4 < 0) #0
+
+#summary(previousloss_3to4)
+#summary(devloss_3to4)
+
+# out_4to5= tweedie.profile(devloss_4to5 ~ previousloss_4to5, p.vec=seq(1, 2, by=0.1),  data= sub_4to5)
+# 
+# names(out_4to5)
+# out_4to5$p.max
+
+fit_4to5= glm(devloss_4to5 ~ previousloss_4to5,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_4to5, model = TRUE)
+
+
+#******************** cannot Fit time directly use the p_max from tweedie_profile (1.8); thus, according to loglikehood, 
+#find the cloest estimator with the second largest L (1.7)
+
+
+  
+  
+  
+### 5. create a subset for predicting loss in dev 6 using loss in dev 5 ### [sub_5to6]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_5to6 = tweedie_reshape[(!is.na(tweedie_reshape[,7])) & (!is.na(tweedie_reshape[,8])),]
+attach(sub_5to6)
+
+# drop rows whose second and third year losses are negative (2) #
+sub_5to6 = sub_5to6[!sub_5to6[,7] < 0,]
+sub_5to6 = sub_5to6[!sub_5to6[,8] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_5to6 = sub_5to6[!round(sub_5to6[,7], 0) == 0,]
+
+
+indiClaimNo_5to6 = sub_5to6[,1]
+acci_year_5to6 = sub_5to6[,2]
+previousloss_5to6 = round(sub_5to6[,7], 0)
+devloss_5to6= round(sub_5to6[,8], 0)
+
+#check row numbers
+#sum(previousloss_3to4 == 0) #0
+#sum(previousloss_3to4 > 0) #5659
+#sum(previousloss_3to4 < 0) #0
+
+#summary(previousloss_3to4)
+#summary(devloss_3to4)
+
+# out_5to6= tweedie.profile(devloss_5to6 ~ previousloss_5to6, p.vec=seq(1, 2, by=0.1),  data= sub_5to6)
+# 
+# names(out_5to6)
+# out_5to6$p.max
+
+fit_5to6= glm(devloss_5to6 ~ previousloss_5to6,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_5to6, model = TRUE)
+
+
+#******************** cannot Fit time directly use the p_max from tweedie_profile (1.9); thus, according to loglikehood, 
+#find the cloest estimator with the forth largest L (1.6)
+
+
+  
+  
+### 6. create a subset for predicting loss in dev 7 using loss in dev 6 ### [sub_6to7]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_6to7 = tweedie_reshape[(!is.na(tweedie_reshape[,8])) & (!is.na(tweedie_reshape[,9])),]
+attach(sub_6to7)
+
+# drop rows whose second and third year losses are negative (2) #
+sub_6to7 = sub_6to7[!sub_6to7[,8] < 0,]
+sub_6to7 = sub_6to7[!sub_6to7[,9] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_6to7 = sub_6to7[!round(sub_6to7[,8], 0) == 0,]
+
+
+indiClaimNo_6to7 = sub_6to7[,1]
+acci_year_6to7 = sub_6to7[,2]
+previousloss_6to7 = round(sub_6to7[,8], 0)
+devloss_6to7= round(sub_6to7[,9], 0)
+
+#check row numbers
+#sum(previousloss_6to7 == 0) #0
+#sum(previousloss_6to7 > 0) #3114
+#sum(previousloss_6to7 < 0) #0
+
+#summary(previousloss_6to7)
+#summary(devloss_6to7)
+
+# out_6to7= tweedie.profile(devloss_6to7 ~ previousloss_6to7, p.vec=seq(1, 2, by=0.1),  data= sub_6to7)
+# 
+# names(out_6to7)
+# out_6to7$p.max
+# out_6to7$L
+
+fit_6to7= glm(devloss_6to7 ~ previousloss_6to7,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_6to7, model = TRUE)
+
+
+#******************** cannot Fit time directly use the p_max from tweedie_profile (1.9); thus, according to loglikehood, 
+#find the cloest estimator with the forth largest L (1.6)
+
+  
+  
+  
+### 7. create a subset for predicting loss in dev 8 using loss in dev 7 ### [sub_7to8]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_7to8 = tweedie_reshape[(!is.na(tweedie_reshape[,9])) & (!is.na(tweedie_reshape[,10])),]
+attach(sub_7to8)
+
+# drop rows whose second and third year losses are negative (2) #
+sub_7to8 = sub_7to8[!sub_7to8[,9] < 0,]
+sub_7to8 = sub_7to8[!sub_7to8[,10] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_7to8 = sub_7to8[!round(sub_7to8[,9], 0) == 0,]
+
+
+indiClaimNo_7to8 = sub_7to8[,1]
+acci_year_7to8 = sub_7to8[,2]
+previousloss_7to8 = round(sub_7to8[,9], 0)
+devloss_7to8= round(sub_7to8[,10], 0)
+
+#check row numbers
+#sum(previousloss_7to8 == 0) #0
+#sum(previousloss_7to8 > 0) #2287
+#sum(previousloss_7to8 < 0) #0
+
+#summary(previousloss_7to8)
+#summary(devloss_7to8)
+
+# out_7to8= tweedie.profile(devloss_7to8 ~ previousloss_7to8, p.vec=seq(1, 2, by=0.1),  data= sub_7to8)
+# 
+# names(out_7to8)
+# out_7to8$p.max
+
+fit_7to8= glm(devloss_7to8 ~ previousloss_7to8,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_7to8, model = TRUE)
+
+
+#******************** cannot Fit time directly use the p_max from tweedie_profile (1.9); thus, according to loglikehood, 
+#find the cloest estimator with the forth largest L (1.6)
+
+
+  
+  
+  
+### 8. create a subset for predicting loss in dev 9 using loss in dev 8 ### [sub_8to9]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_8to9 = tweedie_reshape[(!is.na(tweedie_reshape[,10])) & (!is.na(tweedie_reshape[,11])),]
+attach(sub_8to9)
+
+# drop rows whose second and third year losses are negative (2) #
+sub_8to9 = sub_8to9[!sub_8to9[,10] < 0,]
+sub_8to9 = sub_8to9[!sub_8to9[,11] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_8to9 = sub_8to9[!round(sub_8to9[,10], 0) == 0,]
+
+
+indiClaimNo_8to9 = sub_8to9[,1]
+acci_year_8to9 = sub_8to9[,2]
+previousloss_8to9 = round(sub_8to9[,10], 0)
+devloss_8to9= round(sub_8to9[,11], 0)
+
+#check row numbers
+#sum(previousloss_8to9 == 0) #0
+#sum(previousloss_8to9 > 0) #2287
+#sum(previousloss_8to9 < 0) #0
+
+#summary(previousloss_8to9)
+#summary(devloss_8to9)
+
+# out_8to9= tweedie.profile(devloss_8to9 ~ previousloss_8to9, p.vec=seq(1, 2, by=0.1),  data= sub_8to9)
+# 
+# names(out_8to9)
+# out_8to9$p.max
+
+fit_8to9= glm(devloss_8to9 ~ previousloss_8to9,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_8to9, model = TRUE)
+
+
+#******************** cannot Fit time directly use the p_max from tweedie_profile (1.9); thus, according to loglikehood, 
+#find the cloest estimator with the forth largest L (1.6)
+
+
+  
+  
+  
+### 9. create a subset for predicting loss in dev 10 using loss in dev 9 ### [sub_9to10]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_9to10 = tweedie_reshape[(!is.na(tweedie_reshape[,11])) & (!is.na(tweedie_reshape[,12])),]
+attach(sub_9to10)
+
+# drop rows whose second and third year losses are negative (2) #
+sub_9to10 = sub_9to10[!sub_9to10[,11] < 0,]
+sub_9to10 = sub_9to10[!sub_9to10[,12] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_9to10 = sub_9to10[!round(sub_9to10[,11], 0) == 0,]
+
+
+indiClaimNo_9to10 = sub_9to10[,1]
+acci_year_9to10 = sub_9to10[,2]
+previousloss_9to10 = round(sub_9to10[,11], 0)
+devloss_9to10= round(sub_9to10[,12], 0)
+
+#check row numbers
+#sum(previousloss_9to10 == 0) #0
+#sum(previousloss_9to10 > 0) #2287
+#sum(previousloss_9to10 < 0) #0
+
+#summary(previousloss_9to10)
+#summary(devloss_9to10)
+
+# out_9to10= tweedie.profile(devloss_9to10 ~ previousloss_9to10, p.vec=seq(1, 2, by=0.1),  data= sub_9to10)
+# 
+# names(out_9to10)
+# out_9to10$p.max
+
+fit_9to10= glm(devloss_9to10 ~ previousloss_9to10,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_9to10, model = TRUE)
+
+
+#******************** cannot Fit time directly use the p_max from tweedie_profile (1.9); thus, according to loglikehood, 
+#find the cloest estimator with the thirs largest L (1.7),; however, when using p=1.6 yields results that have sum_ratio closer to 1 then using 1.7
+# 0.9999989 for using 1,7; 
+
+
+
+
+
+### 10. create a subset for predicting loss in dev 11 using loss in dev 10 ### [sub_10to11]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_10to11 = tweedie_reshape[(!is.na(tweedie_reshape[,12])) & (!is.na(tweedie_reshape[,13])),]
+attach(sub_10to11)
+
+# drop rows whose second and third year losses are negative (2) #
+sub_10to11 = sub_10to11[!sub_10to11[,12] < 0,]
+sub_10to11 = sub_10to11[!sub_10to11[,13] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_10to11 = sub_10to11[!round(sub_10to11[,12], 0) == 0,]
+
+
+indiClaimNo_10to11 = sub_10to11[,1]
+acci_year_10to11 = sub_10to11[,2]
+previousloss_10to11 = round(sub_10to11[,12], 0)
+devloss_10to11= round(sub_10to11[,13], 0)
+
+#check row numbers
+#sum(previousloss_10to11 == 0) #0
+#sum(previousloss_10to11 > 0) #2287
+#sum(previousloss_10to11 < 0) #0
+
+#summary(previousloss_10to11)
+#summary(devloss_10to11)
+
+# out_10to11= tweedie.profile(devloss_10to11 ~ previousloss_10to11, p.vec=seq(1, 2, by=0.1),  data= sub_10to11)
+# 
+# names(out_10to11)
+# out_10to11$p.max
+
+fit_10to11= glm(devloss_10to11 ~ previousloss_10to11,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_10to11, model = TRUE)
+
+
+#******************** cannot Fit time directly use the p_max from tweedie_profile (1.9); thus, according to loglikehood, 
+#find the cloest estimator with the third largest L (1.7)
+
+
+  
+  
+### 11. create a subset for predicting loss in dev 12 using loss in dev 11 ### [sub_11to12]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_11to12 = tweedie_reshape[(!is.na(tweedie_reshape[,13])) & (!is.na(tweedie_reshape[,14])),]
+attach(sub_11to12)
+
+# drop rows whose second and third year losses are negative (2) #
+sub_11to12 = sub_11to12[!sub_11to12[,13] < 0,]
+sub_11to12 = sub_11to12[!sub_11to12[,14] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_11to12 = sub_11to12[!round(sub_11to12[,13], 0) == 0,]
+
+
+indiClaimNo_11to12 = sub_11to12[,1]
+acci_year_11to12 = sub_11to12[,2]
+previousloss_11to12 = round(sub_11to12[,13], 0)
+devloss_11to12= round(sub_11to12[,14], 0)
+
+#check row numbers
+#sum(previousloss_11to12 == 0) #0
+#sum(previousloss_11to12 > 0) #671
+#sum(previousloss_11to12 < 0) #0
+
+#summary(previousloss_11to12)
+#summary(devloss_11to12)
+
+# out_11to12= tweedie.profile(devloss_11to12 ~ previousloss_11to12, p.vec=seq(1, 2, by=0.1),  data= sub_11to12)
+# 
+# names(out_11to12)
+# out_11to12$p.max
+
+fit_11to12= glm(devloss_11to12 ~ previousloss_11to12,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_11to12, model = TRUE)
+
+
+#******************** cannot Fit time directly use the p_max from tweedie_profile (1.9); thus, according to loglikehood, 
+#find the closest estimator with the third largest L (1.7)
+
+
+  
+  
+### 12. create a subset for predicting loss in dev 13 using loss in dev 12 ### [sub_12to13]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_12to13 = tweedie_reshape[(!is.na(tweedie_reshape[,14])) & (!is.na(tweedie_reshape[,15])),]
+attach(sub_12to13)
+
+
+# drop rows whose second and third year losses are negative (2) #
+sub_12to13 = sub_12to13[!sub_12to13[,14] < 0,]
+sub_12to13 = sub_12to13[!sub_12to13[,15] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_12to13 = sub_12to13[!round(sub_12to13[,14], 0) == 0,]
+
+
+indiClaimNo_12to13 = sub_12to13[,1]
+acci_year_12to13 = sub_12to13[,2]
+previousloss_12to13 = round(sub_12to13[,14], 0)
+devloss_12to13= round(sub_12to13[,15], 0)
+
+#check row numbers
+#sum(previousloss_12to13 == 0) #0
+#sum(previousloss_12to13 > 0) #168
+#sum(previousloss_12to13 < 0) #0
+
+#summary(previousloss_12to13)
+#summary(devloss_12to13)
+
+# out_12to13= tweedie.profile(devloss_12to13 ~ previousloss_12to13, p.vec=seq(1, 1.9, by=0.1),  data=sub_12to13)
+# 
+# names(out_12to13)
+# out_12to13$p.max
+
+fit_12to13= glm(devloss_12to13 ~ previousloss_12to13,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_12to13, model = TRUE)
+
+
+#******************** 
+
+  
+  
+### 13. create a subset for predicting loss in dev 14 using loss in dev 13 ### [sub_13to14]
+  
+# drop rows whose third year and forth year losses are NAs (1) #
+sub_13to14 = tweedie_reshape[(!is.na(tweedie_reshape[,15])) & (!is.na(tweedie_reshape[,16])),]
+attach(sub_13to14)
+
+
+# drop rows whose second and third year losses are negative (2) #
+sub_13to14 = sub_13to14[!sub_13to14[,15] < 0,]
+sub_13to14 = sub_13to14[!sub_13to14[,16] < 0,]
+
+
+# drop rows whose second year losses are zeros (3) #
+sub_13to14 = sub_13to14[!round(sub_13to14[,15], 0) == 0,]
+
+
+indiClaimNo_13to14 = sub_13to14[,1]
+acci_year_13to14 = sub_13to14[,2]
+previousloss_13to14 = round(sub_13to14[,15], 0)
+devloss_13to14= round(sub_13to14[,16], 0)
+
+#check row numbers
+#sum(previousloss_13to14 == 0) #0
+#sum(previousloss_13to14 > 0) #168
+#sum(previousloss_13to14 < 0) #0
+
+#summary(previousloss_13to14)
+#summary(devloss_13to14)
+
+# out_13to14= tweedie.profile(devloss_13to14 ~ previousloss_13to14, p.vec=seq(1, 1.9, by=0.1),  data=sub_13to14)
+# 
+# names(out_13to14)
+# out_13to14$p.max
+
+fit_13to14= glm(devloss_13to14 ~ previousloss_13to14,family= tweedie(var.power= 1.6, link.power=-0.6), data= sub_13to14, model = TRUE)
+
+
+#******************** 
+
+#Part 3
+
+#ADD a subset for each fitting; [addback_1]
+#1.[previous=NA, dev=num]
+#[previous=NA, dev=NA]
+#[previous=num, dev=NA]
+#2.[previous=0, dev=num] & [previous != na, dev=num != na]
+#3.[previous=!!, dev=nega]
+#sum(dev)
+
+#find the sum for each new subset;[sum_1]
+
+#add the sum when calculating the triangle
+
+
+  
+#subset1
+add_na_1=tweedie_reshape[(is.na(tweedie_reshape[,3])) & (!is.na(tweedie_reshape[,4])),]
+
+
+add_zero_1=tweedie_reshape[(tweedie_reshape[,3]==0) & (tweedie_reshape[,4]>0) & (!is.na(tweedie_reshape[,3]))& (!is.na(tweedie_reshape[,4])),]
+
+
+#find sum
+sum_1= sum(add_na_1[,4]) + sum(add_zero_1[,4])
+sum(property_tri[1:13,2])/(sum(fit_1to2$fitted.values)+ sum_1) #0.9999986
+#sum(property_tri[1:13,2])/sum(fit_1to2$fitted.values) #1.015734
+
+#add sum when triangle #test
+
+
+
+  
+  #subset2
+  add_na_2=tweedie_reshape[(is.na(tweedie_reshape[,4])) & (!is.na(tweedie_reshape[,5])),]
+ 
+
+add_zero_2=tweedie_reshape[(tweedie_reshape[,4]==0) & (tweedie_reshape[,5]>0) & (!is.na(tweedie_reshape[,4]))& (!is.na(tweedie_reshape[,5])),]
+
+
+#find sum
+sum_2= sum(add_na_2[,5]) + sum(add_zero_2[,5])
+sum(property_tri[1:12,3])/(sum(fit_2to3$fitted.values)+ sum_2) #0.9999986
+#sum(property_tri[1:12,3])/sum(fit_1to2$fitted.values) #1.015734
+
+#add sum when triangle
+
+
+#subset3
+add_na_3=tweedie_reshape[(is.na(tweedie_reshape[,5])) & (!is.na(tweedie_reshape[,6])),]
+ 
+
+add_zero_3=tweedie_reshape[(tweedie_reshape[,5]==0) & (tweedie_reshape[,6]>0) & (!is.na(tweedie_reshape[,5]))& (!is.na(tweedie_reshape[,6])),]
+
+
+#find sum
+sum_3= sum(add_na_3[,6]) + sum(add_zero_3[,6])
+sum(property_tri[1:11,4])/(sum(fit_3to4$fitted.values)+ sum_3) #0.9999983
+#sum(property_tri[1:12,3])/sum(fit_3to4$fitted.values) #1.015734
+
+#add sum when triangle
+
+#subset4
+add_na_4=tweedie_reshape[(is.na(tweedie_reshape[,6])) & (!is.na(tweedie_reshape[,7])),]
+
+
+add_zero_4=tweedie_reshape[(tweedie_reshape[,6]==0) & (tweedie_reshape[,7]>0) & (!is.na(tweedie_reshape[,6]))& (!is.na(tweedie_reshape[,7])),]
+
+
+#find sum
+sum_4= sum(add_na_4[,7]) + sum(add_zero_4[,7])
+sum(property_tri[1:10,5])/(sum(fit_4to5$fitted.values)+ sum_4) #0.9999937
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+#subset5
+add_na_5=tweedie_reshape[(is.na(tweedie_reshape[,7])) & (!is.na(tweedie_reshape[,8])),]
+ 
+
+add_zero_5=tweedie_reshape[(tweedie_reshape[,7]==0) & (tweedie_reshape[,8]>0) & (!is.na(tweedie_reshape[,7]))& (!is.na(tweedie_reshape[,8])),]
+
+
+#find sum
+sum_5= sum(add_zero_5[,8]) + sum(add_zero_5[,8])
+sum(property_tri[1:9,6])/(sum(fit_5to6$fitted.values)+ sum_5) #1.000236
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+#subset6
+add_na_6=tweedie_reshape[(is.na(tweedie_reshape[,8])) & (!is.na(tweedie_reshape[,9])),]
+
+add_zero_6=tweedie_reshape[(tweedie_reshape[,8]==0) & (tweedie_reshape[,9]>0) & (!is.na(tweedie_reshape[,8]))& (!is.na(tweedie_reshape[,9])),]
+
+
+#find sum
+sum_6= sum(add_zero_6[,9]) + sum(add_zero_6[,9])
+sum(property_tri[1:8,7])/(sum(fit_6to7$fitted.values)+ sum_6) #1.000024
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+
+#subset7
+add_na_7=tweedie_reshape[(is.na(tweedie_reshape[,9])) & (!is.na(tweedie_reshape[,10])),]
+ 
+
+add_zero_7=tweedie_reshape[(tweedie_reshape[,9]==0) & (tweedie_reshape[,10]>0) & (!is.na(tweedie_reshape[,9]))& (!is.na(tweedie_reshape[,10])),]
+
+
+#find sum
+sum_7= sum(add_zero_7[,10]) + sum(add_zero_7[,10])
+sum(property_tri[1:7,8])/(sum(fit_7to8$fitted.values)+ sum_7) #1.000017
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+
+#subset8
+add_na_8=tweedie_reshape[(is.na(tweedie_reshape[,10])) & (!is.na(tweedie_reshape[,11])),]
+ 
+
+add_zero_8=tweedie_reshape[(tweedie_reshape[,10]==0) & (tweedie_reshape[,11]>0) & (!is.na(tweedie_reshape[,10]))& (!is.na(tweedie_reshape[,11])),]
+
+
+#find sum
+sum_8= sum(add_zero_8[,11]) + sum(add_zero_8[,11])
+sum(property_tri[1:6,9])/(sum(fit_8to9$fitted.values)+ sum_8) #0.9999057
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+#subset9
+add_na_9=tweedie_reshape[(is.na(tweedie_reshape[,11])) & (!is.na(tweedie_reshape[,12])),]
+
+
+add_zero_9=tweedie_reshape[(tweedie_reshape[,11]==0) & (tweedie_reshape[,12]>0) & (!is.na(tweedie_reshape[,11]))& (!is.na(tweedie_reshape[,12])),]
+
+
+#find sum
+sum_9= sum(add_zero_9[,12]) + sum(add_zero_9[,12])
+sum(property_tri[1:5,10])/(sum(fit_9to10$fitted.values)+ sum_9) #0.9999988
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+#subset10
+add_na_10=tweedie_reshape[(is.na(tweedie_reshape[,12])) & (!is.na(tweedie_reshape[,13])),]
+  
+
+add_zero_10=tweedie_reshape[(tweedie_reshape[,12]==0) & (tweedie_reshape[,13]>0) & (!is.na(tweedie_reshape[,12]))& (!is.na(tweedie_reshape[,13])),]
+
+
+#find sum
+sum_10= sum(add_zero_10[,13]) + sum(add_zero_10[,13])
+sum(property_tri[1:4,11])/(sum(fit_10to11$fitted.values)+ sum_10) #0.9999989
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+#subset11
+add_na_11=tweedie_reshape[(is.na(tweedie_reshape[,13])) & (!is.na(tweedie_reshape[,14])),]
+
+
+add_zero_11=tweedie_reshape[(tweedie_reshape[,13]==0) & (tweedie_reshape[,14]>0) & (!is.na(tweedie_reshape[,13]))& (!is.na(tweedie_reshape[,14])),]
+
+
+#find sum
+sum_11= sum(add_zero_11[,14]) + sum(add_zero_11[,14])
+sum(property_tri[1:3,12])/(sum(fit_11to12$fitted.values)+ sum_11) #0.9999969
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+
+#subset12
+add_na_12=tweedie_reshape[(is.na(tweedie_reshape[,14])) & (!is.na(tweedie_reshape[,15])),]
+
+
+add_zero_12=tweedie_reshape[(tweedie_reshape[,14]==0) & (tweedie_reshape[,15]>0) & (!is.na(tweedie_reshape[,14]))& (!is.na(tweedie_reshape[,15])),]
+
+
+#find sum
+sum_12= sum(add_zero_12[,15]) + sum(add_zero_12[,15])
+sum(property_tri[1:2,13])/(sum(fit_12to13$fitted.values)+ sum_12) #0.9999999
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+
+#subset13
+add_na_13=tweedie_reshape[(is.na(tweedie_reshape[,15])) & (!is.na(tweedie_reshape[,16])),]
+  
+
+add_zero_13=tweedie_reshape[(tweedie_reshape[,15]==0) & (tweedie_reshape[,16]>0) & (!is.na(tweedie_reshape[,15]))& (!is.na(tweedie_reshape[,16])),]
+
+
+#find sum
+sum_13= sum(add_zero_13[,16]) + sum(add_zero_13[,16])
+sum(property_tri[1:1,14])/(sum(fit_13to14$fitted.values)+ sum_13) #1
+#sum(property_tri[1:12,3])/sum(fit_4to5$fitted.values) #1.015734
+
+#add sum when triangle
+
+
+
+
+
+### create 1st column for property_tweedie ###
+property_tri[,1]
+
+### create 2nd column for property_tweedie ###
+sub1to2_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub1to2_col)){
+  k=as.character(i+2001)
+  sub1to2_col[i, 1]=sum(fit_1to2$fitted.values[which(sub_1to2$acci_year == k)])+ sum(add_na_1[which(add_na_1[,2]==k),4])+ sum(add_zero_1[which(add_zero_1[,2]==k),4]) 
+}
+
+
+
+### create 3rd column for property_tweedie ###
+sub2to3_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub2to3_col)){
+  k=as.character(i+2001)
+  sub2to3_col[i, 1]=sum(fit_2to3$fitted.values[which(sub_2to3$acci_year == k)])+ sum(add_na_2[which(add_na_2[,2]==k),5])+ sum(add_zero_2[which(add_zero_2[,2]==k),5])
+}
+
+
+### create 4th column for property_tweedie ###
+sub3to4_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub3to4_col)){
+  k=as.character(i+2001)
+  sub3to4_col[i, 1]=sum(fit_3to4$fitted.values[which(sub_3to4$acci_year == k)])+sum(add_na_3[which(add_na_3[,2]==k),6])+ sum(add_zero_3[which(add_zero_3[,2]==k),6])
+}
+
+
+
+### create 5th column for property_tweedie ###
+sub4to5_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub4to5_col)){
+  k=as.character(i+2001)
+  sub4to5_col[i, 1]=sum(fit_4to5$fitted.values[which(sub_4to5$acci_year == k)])+sum(add_na_4[which(add_na_4[,2]==k),7])+ sum(add_zero_4[which(add_zero_4[,2]==k),7])
+}
+
+
+
+
+### create 6th column for property_tweedie ###
+sub5to6_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub5to6_col)){
+  k=as.character(i+2001)
+  sub5to6_col[i, 1]=sum(fit_5to6$fitted.values[which(sub_5to6$acci_year == k)])+sum(add_na_5[which(add_na_5[,2]==k),8])+ sum(add_zero_5[which(add_zero_5[,2]==k),8])
+}
+
+
+
+### create 7th column for property_tweedie ###
+sub6to7_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub6to7_col)){
+  k=as.character(i+2001)
+  sub6to7_col[i, 1]=sum(fit_6to7$fitted.values[which(sub_6to7$acci_year == k)])+sum(add_na_6[which(add_na_6[,2]==k),9])+ sum(add_zero_6[which(add_zero_6[,2]==k),9])
+}
+
+
+
+
+### create 8th column for property_tweedie ###
+sub7to8_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub7to8_col)){
+  k=as.character(i+2001)
+  sub7to8_col[i, 1]=sum(fit_7to8$fitted.values[which(sub_7to8$acci_year == k)])+sum(add_na_7[which(add_na_7[,2]==k),10])+ sum(add_zero_7[which(add_zero_7[,2]==k),10])
+}
+
+
+
+### create 9th column for property_tweedie ###
+sub8to9_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub8to9_col)){
+  k=as.character(i+2001)
+  sub8to9_col[i, 1]=sum(fit_8to9$fitted.values[which(sub_8to9$acci_year == k)])+sum(add_na_8[which(add_na_8[,2]==k),11])+ sum(add_zero_8[which(add_zero_8[,2]==k),11])
+}
+
+
+
+
+### create 10th column for property_tweedie ###
+sub9to10_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub9to10_col)){
+  k=as.character(i+2001)
+  sub9to10_col[i, 1]=sum(fit_9to10$fitted.values[which(sub_9to10$acci_year == k)])+sum(add_na_9[which(add_na_9[,2]==k),12])+ sum(add_zero_9[which(add_zero_9[,2]==k),12])
+}
+
+
+
+### create 11th column for property_tweedie ###
+sub10to11_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub10to11_col)){
+  k=as.character(i+2001)
+  sub10to11_col[i, 1]=sum(fit_10to11$fitted.values[which(sub_10to11$acci_year == k)])+sum(add_na_10[which(add_na_10[,2]==k),13])+ sum(add_zero_10[which(add_zero_10[,2]==k),13])
+}
+
+
+
+
+### create 12th column for property_tweedie ###
+sub11to12_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub11to12_col)){
+  k=as.character(i+2001)
+  sub11to12_col[i, 1]=sum(fit_11to12$fitted.values[which(sub_11to12$acci_year == k)])+sum(add_na_11[which(add_na_11[,2]==k),14])+ sum(add_zero_11[which(add_zero_11[,2]==k),14])
+}
+
+
+
+
+### create 13th column for property_tweedie ###
+sub12to13_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub12to13_col)){
+  k=as.character(i+2001)
+  sub12to13_col[i, 1]=sum(fit_12to13$fitted.values[which(sub_12to13$acci_year == k)])+sum(add_na_12[which(add_na_12[,2]==k),15])+ sum(add_zero_12[which(add_zero_12[,2]==k),15])
+}
+
+
+
+
+### create 14th column for property_tweedie ###
+sub13to14_col= matrix(nrow=14,ncol=1)
+
+for(i in 1: nrow(sub13to14_col)){
+  k=as.character(i+2001)
+  sub13to14_col[i, 1]=sum(fit_13to14$fitted.values[which(sub_13to14$acci_year == k)])+sum(add_na_13[which(add_na_13[,2]==k),16])+ sum(add_zero_13[which(add_zero_13[,2]==k),16])
+}
+
+
+
+#Part 4 #
+### Create the tweedie triangle ###
+
+# first, Create a matrix to input the values obtained from chainladder: 
+property_tweedie=matrix(nrow=nrow(property_tri),ncol=nrow(property_tri))
+
+# Second, Combine the individual column into the new tweedie triangle:
+property_tweedie=cbind( property_tri[,1],sub1to2_col, sub2to3_col, sub3to4_col, sub4to5_col, sub5to6_col, sub6to7_col,
+                       sub7to8_col, sub8to9_col, sub9to10_col, sub10to11_col, sub11to12_col, sub12to13_col, sub13to14_col)
+
+# Third change the defalut zero values into NA values;
+property_tweedie[property_tweedie == 0] <- NA
+
+# Lastly, transform the matrix into a triangle; 
+tweedie_Tri<-as.triangle(property_tweedie,origin="AccidentYear",dev="devcol",value="Tweedie Loss")
+tweedie_Tri
+plot(tweedie_Tri)
+
+# Part 5 #
+
+### calculate the Year to Year Ratio for Tweedie triangle ###
+n <- ncol(tweedie_Tri)
+
+f_yearRatioTweedie <- sapply(1:(n-1),
+                             function(i){
+                               sum(tweedie_Tri[c(1:(n-i)),i+1])/sum(tweedie_Tri[c(1:(n-i)),i])
+                             } )
+f_yearRatioTweedie
+  
+  
+### Calculate the ultimate loss for the tweedie triangle ###
+f.tailTweedie=f_yearRatioTweedie[length(f_yearRatioTweedie)]
+f_yearRatioTweedie <- c(f_yearRatioTweedie, f.tailTweedie)
+full_Tweedie <- cbind(tweedie_Tri, Ult = rep(0, 14))
+for(k in 1:n){
+  full_Tweedie[(n-k+1):n, k+1] <- full_Tweedie[(n-k+1):n,k]*f_yearRatioTweedie[k]
+}
+full_Tweedie= round(full_Tweedie)
+
+
+# Also, calculate the Year to Year Ratio Matrix for Tweedie model:
+individualRatio_Tweedie=  matrix(nrow=nrow(tweedie_Tri)-1,ncol=ncol(tweedie_Tri)-1)
+
+for(i in 1:nrow(individualRatio_Tweedie)){
+  
+  for(j in 1:ncol(individualRatio_Tweedie)){
+    in_Ratio = tweedie_Tri[i, j+1]/tweedie_Tri[i, j]
+    #print(j)
+    individualRatio_Tweedie[i,j]= in_Ratio
+  }
+}
+
+yearRatio_Tweedie<-as.triangle(individualRatio_Tweedie,origin="property_data$AccidentYear",dev="property_data$devcol",value="YeartoYearRatio__ChainLadder")
+yearRatio_Tweedie
+```
+
+
+
+
+tri = property_tri
+
+dsub=NULL
+
+#glm_default(gaussian)_part
+subyear<-matrix(nrow=14,ncol=14)
+fityear<-matrix(nrow=14,ncol=14)
+for(i in 1:13){
+  sub = tweedie_reshape[(!is.na(tweedie_reshape[,2+i])) & (!is.na(tweedie_reshape[,3+i])),]
+  esub=tweedie_reshape[(is.na(tweedie_reshape[,2+i])) & (!is.na(tweedie_reshape[,3+i])),]
+  #fsub= c(esub,sub[sub[,2+i] < 0,])
+  sub = sub[!sub[,2+i] < 0,]
+  #esub= c(esub,sub[sub[,3+i] < 0,])
+  sub = sub[!sub[,3+i] < 0,]
+  #esub= c(esub,sub[round(sub[,2+i], 0) == 0,])
+  sub = sub[!round(sub[,2+i], 0) == 0,]
+  #esub= c(esub,sub[round(sub[,3+i], 0) == 0,])
+  sub = sub[!round(sub[,3+i], 0) == 0,]
+  m=14-i
+  for(j in 1:m){
+    #newsub<-sub[sub[,2]==2001+j,]
+    #print(j)
+    #print(nrow(newsub))
+    previousloss = round(sub[,2+i], 0)
+    devloss= round(sub[,3+i], 0)
+    fit=glm(devloss ~ previousloss, model = TRUE)
+    k=as.character(j+2001)
+    
+    fityear[i,j+1]=sum(fit$fitted.values[which(sub[,2] == k)])+sum(esub[which(esub[,2]==k),i+3])
+  }
+  print(nrow(sub))
+}
+for(i in 1:14){
+  fityear[i,1]=tri[i,1]
+}
+
+fityear
+
+fityear.gaussian=fityear
+plot(fityear)
+write.csv(fityear,
+          "G:/Statistics homework/443/consulting project/prediction with newglm fixed.csv")
+for(i in 1:14){
+  l=15-i
+  for(m in 1:l)
+  {
+    a=fityear[i,m]/tri[i,m]
+    print(a)
+  }
+}
+
+#POISSON
+subyear<-matrix(nrow=14,ncol=14)
+fityear<-matrix(nrow=14,ncol=14)
+for(i in 1:13){
+  sub = tweedie_reshape[(!is.na(tweedie_reshape[,2+i])) & (!is.na(tweedie_reshape[,3+i])),]
+  esub=tweedie_reshape[(is.na(tweedie_reshape[,2+i])) & (!is.na(tweedie_reshape[,3+i])),]
+  sub = sub[!sub[,2+i] < 0,]
+  sub = sub[!sub[,3+i] < 0,]
+  sub = sub[!round(sub[,2+i], 0) == 0,]
+  sub = sub[!round(sub[,3+i], 0) == 0,]
+  m=14-i
+  for(j in 1:m){
+    #newsub<-sub[sub[,2]==2001+j,]
+    #print(j)
+    #print(nrow(newsub))
+    previousloss = round(sub[,2+i], 0)
+    devloss= round(sub[,3+i], 0)
+    fit=glm(devloss ~ previousloss,family=poisson())
+    fityear[i,j+1]=sum(fit$fitted.values[which(sub[,2] == 2001+j)])+sum(esub[which(esub[,2]==k),i+3])
+  }
+  print(nrow(sub))
+}
+for(i in 1:14){
+  fityear[i,1]=tri[i,1]}
+fityear
+fityear.poisson=fityear
+write.csv(fityear,
+          "G:/Statistics homework/443/consulting project/prediction with newglm_poisson fixed.csv")
+for(i in 1:14){
+  l=15-i
+  for(m in 1:l)
+  {
+    a=fityear[i,m]/tri[i,m]
+    print(a)
+  }
+}
+
+
+
+
+
+## 1. year ratio
+n <- ncol(property_tri)
+property_tri
+f_yeartoyearRatio <- sapply(1:(n-1),
+                            function(i){
+                              sum(property_tri[c(1:(n-i)),i+1])/sum(property_tri[c(1:(n-i)),i])
+                            } )
+f_yeartoyearRatio
+
+
+## 2. ultimate loss
+f.tail=f_yeartoyearRatio[length(f_yeartoyearRatio)]
+f_yeartoyearRatio <- c(f_yeartoyearRatio, f.tail)
+full_property <- cbind(property_tri, Ult = rep(0, 14))
+for(k in 1:n){
+  full_property[(n-k+1):n, k+1] <- full_property[(n-k+1):n,k]*f_yeartoyearRatio[k]
+}
+full_property= round(full_property)
+full_property
+write.csv(full_property,
+          "G:/Statistics homework/443/consulting project/fulltriangle with newglm fixed.csv")
+
+
+
+
+# Also, calculate the Year to Year Ratio Matrix for Chain ladder model:
+
+individualRatio_ChainLadder=  matrix(nrow=nrow(ChainLadder_Tri)-1,ncol=ncol(ChainLadder_Tri)-1)
+
+for(i in 1:nrow(individualRatio_ChainLadder)){
+  
+  for(j in 1:ncol(individualRatio_ChainLadder)){
+    in_Ratio = ChainLadder_Tri[i, j+1]/ChainLadder_Tri[i, j]
+    #print(j)
+    individualRatio_ChainLadder[i,j]= in_Ratio
+  }
+}
+
+yearRatio_ChainLadder<-as.triangle(individualRatio_ChainLadder,origin="property_data$AccidentYear",dev="property_data$devcol",value="YeartoYearRatio__ChainLadder")
+yearRatio_ChainLadder
+write.csv(full_property,
+          "G:/Statistics homework/443/consulting project/yearRatio with newglm fixed.csv")
+
+### Calculate the ultimate loss for the chain ladder triangle ###
+
+f.tailChainLadder=yearRatio_ChainLadder[1,ncol(yearRatio_ChainLadder)]
+
+f_ult_ChainLadder <- c(f_ult_ChainLadder, f.tailChainLadder)
+full_ChainLadder <- cbind(ChainLadder_Tri, Ult = rep(0, 14))
+for(k in 1:n){
+  full_ChainLadder[(n-k+1):n, k+1] <- full_ChainLadder[(n-k+1):n,k]*f[k]
+}
+full_ChainLadder_Tri=round(full_ChainLadder)
+full_ChainLadder_Tri
+#class(full_ChainLadder_Tri) #matrix
+
+
+
+
+
+
